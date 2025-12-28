@@ -1,9 +1,9 @@
 """Yasno Outages API package."""
 
+from .cek import CekPlannedOutagesApi
 from .models import OutageEvent, OutageEventType, OutageSlot
 from .planned import PlannedOutagesApi
 from .probable import ProbableOutagesApi
-from .cek import CekPlannedOutagesApi
 
 
 class YasnoApi:

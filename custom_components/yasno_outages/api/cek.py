@@ -4,13 +4,12 @@ import datetime
 import html
 import logging
 import re
-from typing import Final, Iterable
+from collections.abc import Iterable
+from typing import Final
 
 import aiohttp
 
 from .const import (
-    API_KEY_DATE,
-    API_KEY_STATUS,
     API_KEY_TODAY,
     API_KEY_TOMORROW,
     API_STATUS_SCHEDULE_APPLIES,
@@ -79,7 +78,7 @@ RE_GROUP_STRICT = re.compile(r"📌\s*(\d\.\d)")
 
 # Час: 06:00 - 11:00, 06:00 до 11:00
 RE_TIME_RANGE = re.compile(
-    r"(\d{1,2}:\d{2})\s*(?:до|по|-)\s*(\d{1,2}:\d{2})",  # noqa: RUF001
+    r"(\d{1,2}:\d{2})\s*(?:до|по|-)\s*(\d{1,2}:\d{2})",
     re.IGNORECASE,
 )
 
