@@ -1073,6 +1073,7 @@ name = "ha-yasno-outages"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "homeassistant" },
     { name = "python-dateutil" },
 ]
@@ -1089,6 +1090,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "homeassistant", specifier = "==2025.11.3" },
     { name = "python-dateutil", specifier = ">=2.8.2" },
 ]

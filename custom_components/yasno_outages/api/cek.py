@@ -1,8 +1,10 @@
+"""API for fetching planned outages from CEK Telegram channel."""
+
 import datetime
 import html
 import logging
 import re
-from typing import Final
+from typing import Final, Iterable
 
 import aiohttp
 
@@ -19,6 +21,11 @@ from .planned import PlannedOutagesApi
 LOGGER = logging.getLogger(__name__)
 
 CEK_TELEGRAM_URL: Final = "https://t.me/s/cek_info"
+
+HTTP_OK: Final = 200
+MINUTES_IN_DAY: Final = 1440
+MONTH_JANUARY: Final = 1
+MONTH_DECEMBER: Final = 12
 
 MONTHS_MAP = {
     "СІЧНЯ": 1,
@@ -62,15 +69,19 @@ RE_MESSAGE = re.compile(
 )
 
 # Дата: "29 ГРУДНЯ", "02 грудня"
-RE_DATE = re.compile(r"(\d{1,2})\s+([А-ЯІЇЄа-яіїє]+)", re.IGNORECASE)
+RE_DATE = re.compile(
+    r"(\d{1,2})\s+([А-ЯІЇЄа-яіїє]+)",
+    re.IGNORECASE,
+)  # noqa: RUF001
 
 # Група: 1.1, 2.1
 RE_GROUP_STRICT = re.compile(r"📌\s*(\d\.\d)")
 
 # Час: 06:00 - 11:00, 06:00 до 11:00
 RE_TIME_RANGE = re.compile(
-    r"(\d{1,2}:\d{2})\s*(?:до|по|-)\s*(\d{1,2}:\d{2})", re.IGNORECASE
-)
+    r"(\d{1,2}:\d{2})\s*(?:до|по|-)\s*(\d{1,2}:\d{2})",
+    re.IGNORECASE,
+)  # noqa: RUF001
 
 # Слова-маркери повного графіку
 FULL_SCHEDULE_MARKERS = [
@@ -93,17 +104,19 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 LOGGER.debug("Successfully fetched CEK data for group %s", self.group)
                 return
             LOGGER.debug("No relevant CEK data found for group %s", self.group)
-        except Exception as err:
-            LOGGER.warning("Failed to fetch CEK Telegram: %s. Fallback.", err)
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("Failed to fetch CEK Telegram. Fallback.", exc_info=True)
 
         await super().fetch_planned_outages_data()
 
     async def _fetch_telegram_data(self) -> dict | None:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(CEK_TELEGRAM_URL) as response:
-                if response.status != 200:
-                    return None
-                html_content = await response.text()
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(CEK_TELEGRAM_URL) as response,
+        ):
+            if response.status != HTTP_OK:
+                return None
+            html_content = await response.text()
 
         messages = self._extract_messages(html_content)
         # Parse chronologically (old -> new) for correct state accumulation
@@ -119,9 +132,10 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             messages.append(text)
         return messages
 
-    def _parse_messages_to_schedule(self, messages_iter) -> dict:
+    def _parse_messages_to_schedule(self, messages_iter: Iterable[str]) -> dict:
         schedule = {}  # {group: {day_key: {"date":..., "slots": [...]}}}
-        today = datetime.datetime.now().date()
+        # Use local today, but without tz info as telegram messages don't have year
+        today = datetime.datetime.now().date()  # noqa: DTZ005
         tomorrow = today + datetime.timedelta(days=1)
 
         for msg in messages_iter:
@@ -140,9 +154,13 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             month_num = MONTHS_MAP[month_name]
 
             year = today.year
-            if month_num == 1 and today.month == 12:
+            if (
+                month_num == MONTH_JANUARY and today.month == MONTH_DECEMBER
+            ):  # New year transition
                 year += 1
-            elif month_num == 12 and today.month == 1:
+            elif (
+                month_num == MONTH_DECEMBER and today.month == MONTH_JANUARY
+            ):  # Old messages in Jan
                 year -= 1
 
             msg_date = datetime.date(year, month_num, day_num)
@@ -158,7 +176,13 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             # Визначаємо тип повідомлення: повне оновлення чи патч?
             is_full_update = any(m in msg.lower() for m in FULL_SCHEDULE_MARKERS)
 
-            self._parse_message_body(msg, msg_date, day_key, schedule, is_full_update)
+            self._parse_message_body(
+                msg,
+                msg_date,
+                day_key,
+                schedule,
+                is_full_update=is_full_update,
+            )
 
         return schedule
 
@@ -168,6 +192,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
         date: datetime.date,
         day_key: str,
         schedule: dict,
+        *,
         is_full_update: bool,
     ) -> None:
         parts = re.split(r"(📌\s*\d\.\d)", text)
@@ -220,14 +245,18 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             start_min = self._time_to_minutes(start_str)
             end_min = self._time_to_minutes(end_str)
             if end_min == 0:
-                end_min = 1440
+                end_min = MINUTES_IN_DAY
             ranges.append((start_min, end_min))
         return ranges
 
     def _ranges_to_slots(self, ranges: list[tuple[int, int]]) -> list[dict]:
         if not ranges:
             return [
-                {"start": 0, "end": 1440, "type": OutageEventType.NOT_PLANNED.value}
+                {
+                    "start": 0,
+                    "end": MINUTES_IN_DAY,
+                    "type": OutageEventType.NOT_PLANNED.value,
+                }
             ]
 
         # Merge overlaps
@@ -263,11 +292,11 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             )
             current_time = end
 
-        if current_time < 1440:
+        if current_time < MINUTES_IN_DAY:
             final_slots.append(
                 {
                     "start": current_time,
-                    "end": 1440,
+                    "end": MINUTES_IN_DAY,
                     "type": OutageEventType.NOT_PLANNED.value,
                 }
             )
@@ -277,4 +306,3 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
     def _time_to_minutes(self, time_str: str) -> int:
         h, m = map(int, time_str.split(":"))
         return h * 60 + m
-
