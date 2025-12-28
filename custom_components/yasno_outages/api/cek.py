@@ -103,14 +103,23 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 LOGGER.debug("Successfully fetched CEK data for group %s", self.group)
                 return
             LOGGER.debug("No relevant CEK data found for group %s", self.group)
+        except aiohttp.ClientError as err:
+            LOGGER.warning(
+                "Could not fetch CEK Telegram data (network error: %s). "
+                "Fallback to Yasno.",
+                err,
+            )
         except Exception:  # noqa: BLE001
-            LOGGER.warning("Failed to fetch CEK Telegram. Fallback.", exc_info=True)
+            LOGGER.warning(
+                "Error processing CEK Telegram data. Fallback.", exc_info=True
+            )
 
         await super().fetch_planned_outages_data()
 
     async def _fetch_telegram_data(self) -> dict | None:
+        timeout = aiohttp.ClientTimeout(total=60)
         async with (
-            aiohttp.ClientSession() as session,
+            aiohttp.ClientSession(timeout=timeout) as session,
             session.get(CEK_TELEGRAM_URL) as response,
         ):
             if response.status != HTTP_OK:
