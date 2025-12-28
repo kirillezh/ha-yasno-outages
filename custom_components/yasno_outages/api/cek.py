@@ -173,6 +173,12 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
             msg_date = datetime.date(year, month_num, day_num)
 
+            # FIX: Convert date to ISO string with timezone
+            # to produce aware datetime objects later
+            dt_naive = datetime.datetime.combine(msg_date, datetime.time.min)
+            dt_aware = dt_naive.astimezone()
+            date_str = dt_aware.isoformat()
+
             day_key = None
             if msg_date == today:
                 day_key = API_KEY_TODAY
@@ -186,7 +192,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
             self._parse_message_body(
                 msg,
-                msg_date,
+                date_str,
                 day_key,
                 schedule,
                 is_full_update=is_full_update,
@@ -197,7 +203,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
     def _parse_message_body(
         self,
         text: str,
-        date: datetime.date,
+        date_str: str,
         day_key: str,
         schedule: dict,
         *,
@@ -224,7 +230,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 # Ініціалізація структури дня, якщо немає
                 if day_key not in schedule[current_group]:
                     schedule[current_group][day_key] = {
-                        "date": date.isoformat(),
+                        "date": date_str,
                         "status": API_STATUS_SCHEDULE_APPLIES,
                         "slots": [],  # Починаємо з порожнього
                     }
