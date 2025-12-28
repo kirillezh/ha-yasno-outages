@@ -13,6 +13,7 @@ from .const import (
     API_KEY_TODAY,
     API_KEY_TOMORROW,
     API_KEY_UPDATED_ON,
+    API_STATUS_WAITING_FOR_SCHEDULE,
     PLANNED_OUTAGES_ENDPOINT,
 )
 from .models import OutageEvent, OutageSource
@@ -100,6 +101,13 @@ class PlannedOutagesApi(BaseYasnoApi):
             return []
 
         day_data = group_data[day_key]
+
+        if day_data.get(API_KEY_STATUS) == API_STATUS_WAITING_FOR_SCHEDULE:
+            LOGGER.debug(
+                "Schedule status is WaitingForSchedule for %s, ignoring slots", day_key
+            )
+            return []
+
         if API_KEY_DATE not in day_data:
             return []
 

@@ -3,6 +3,7 @@
 from .models import OutageEvent, OutageEventType, OutageSlot
 from .planned import PlannedOutagesApi
 from .probable import ProbableOutagesApi
+from .cek import CekPlannedOutagesApi
 
 
 class YasnoApi:
@@ -13,9 +14,13 @@ class YasnoApi:
         region_id: int | None = None,
         provider_id: int | None = None,
         group: str | None = None,
+        provider_name: str | None = None,
     ) -> None:
         """Initialize the YasnoApi facade."""
-        self._planned = PlannedOutagesApi(region_id, provider_id, group)
+        if provider_name and "ЦЕК" in provider_name.upper():
+            self._planned = CekPlannedOutagesApi(region_id, provider_id, group)
+        else:
+            self._planned = PlannedOutagesApi(region_id, provider_id, group)
         self._probable = ProbableOutagesApi(region_id, provider_id, group)
 
     @property

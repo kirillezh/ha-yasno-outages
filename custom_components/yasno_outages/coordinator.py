@@ -191,6 +191,7 @@ class YasnoOutagesCoordinator(DataUpdateCoordinator):
                 region_id=self.region_id,
                 provider_id=self.provider_id,
                 group=self.group,
+                provider_name=self.provider,
             )
 
         # Fetch planned outages data
