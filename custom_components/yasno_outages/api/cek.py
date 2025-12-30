@@ -6,13 +6,17 @@ import logging
 import re
 from collections.abc import Iterable
 from typing import Final
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
 from .const import (
+    API_KEY_STATUS,
     API_KEY_TODAY,
     API_KEY_TOMORROW,
+    API_STATUS_EMERGENCY_SHUTDOWNS,
     API_STATUS_SCHEDULE_APPLIES,
+    API_STATUS_WAITING_FOR_SCHEDULE,
 )
 from .models import OutageEventType
 from .planned import PlannedOutagesApi
@@ -39,18 +43,6 @@ MONTHS_MAP = {
     "ЖОВТНЯ": 10,
     "ЛИСТОПАДА": 11,
     "ГРУДНЯ": 12,
-    "січня": 1,
-    "лютого": 2,
-    "березня": 3,
-    "квітня": 4,
-    "травня": 5,
-    "червня": 6,
-    "липня": 7,
-    "серпня": 8,
-    "вересня": 9,
-    "жовтня": 10,
-    "листопада": 11,
-    "грудня": 12,
 }
 
 IGNORED_CITIES = [
@@ -67,22 +59,25 @@ RE_MESSAGE = re.compile(
     re.DOTALL,
 )
 
-# Дата: "29 ГРУДНЯ", "02 грудня"
+# Regex to extract publication time from <time datetime="...">
+RE_TIME = re.compile(r'<time datetime="([^"]+)" class="time">')
+
+# Date: "29 ГРУДНЯ", "02 грудня"
 RE_DATE = re.compile(
     r"(\d{1,2})\s+([А-ЯІЇЄа-яіїє]+)",  # noqa: RUF001
     re.IGNORECASE,
 )
 
-# Група: 1.1, 2.1
+# Group: 1.1, 2.1
 RE_GROUP_STRICT = re.compile(r"📌\s*(\d\.\d)")
 
-# Час: 06:00 - 11:00, 06:00 до 11:00
+# Time: 06:00 - 11:00, 06:00 to 11:00
 RE_TIME_RANGE = re.compile(
     r"(\d{1,2}:\d{2})\s*(?:до|по|-)\s*(\d{1,2}:\d{2})",
     re.IGNORECASE,
 )
 
-# Слова-маркери повного графіку
+# Full schedule markers
 FULL_SCHEDULE_MARKERS = [
     "зміни в гпв",
     "графік погодинних відключень",
@@ -96,25 +91,58 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
     async def fetch_planned_outages_data(self) -> None:
         """Fetch planned outages data using custom source, fallback to Yasno."""
+        # 1. Fetch Yasno data first (for emergency status and fallback)
+        yasno_data = None
         try:
-            custom_data = await self._fetch_telegram_data()
-            if custom_data and self.group in custom_data:
-                self.planned_outages_data = custom_data
-                LOGGER.debug("Successfully fetched CEK data for group %s", self.group)
-                return
-            LOGGER.debug("No relevant CEK data found for group %s", self.group)
+            await super().fetch_planned_outages_data()
+            yasno_data = self.planned_outages_data
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("Failed to fetch Yasno data", exc_info=True)
+
+        # 2. Fetch CEK Telegram data
+        cek_data = None
+        try:
+            cek_data = await self._fetch_telegram_data()
         except aiohttp.ClientError as err:
             LOGGER.warning(
-                "Could not fetch CEK Telegram data (network error: %s). "
-                "Fallback to Yasno.",
+                "Could not fetch CEK Telegram data (network error: %s).",
                 err,
             )
         except Exception:  # noqa: BLE001
-            LOGGER.warning(
-                "Error processing CEK Telegram data. Fallback.", exc_info=True
-            )
+            LOGGER.warning("Error processing CEK Telegram data.", exc_info=True)
 
-        await super().fetch_planned_outages_data()
+        # 3. Combine logic
+        if cek_data and self.group in cek_data:
+            # Use CEK data as primary
+            self.planned_outages_data = cek_data
+            LOGGER.debug("Successfully fetched CEK data for group %s", self.group)
+
+            # Inject Emergency status from Yasno if present
+            if yasno_data and self.group in yasno_data:
+                self._inject_emergency_status(yasno_data)
+        elif yasno_data:
+            # Fallback to Yasno
+            self.planned_outages_data = yasno_data
+            LOGGER.debug("Fallback to Yasno data for group %s", self.group)
+        else:
+            LOGGER.error("Both Yasno and CEK APIs failed to return data")
+
+    def _inject_emergency_status(self, yasno_data: dict) -> None:
+        """Inject emergency status from Yasno data into CEK data."""
+        yasno_group = yasno_data[self.group]
+        cek_group = self.planned_outages_data[self.group]
+
+        for day_key in (API_KEY_TODAY, API_KEY_TOMORROW):
+            if day_key not in yasno_group or day_key not in cek_group:
+                continue
+
+            yasno_status = yasno_group[day_key].get(API_KEY_STATUS)
+            if yasno_status == API_STATUS_EMERGENCY_SHUTDOWNS:
+                LOGGER.info(
+                    "Injecting Emergency status from Yasno into CEK data for %s",
+                    day_key,
+                )
+                cek_group[day_key][API_KEY_STATUS] = API_STATUS_EMERGENCY_SHUTDOWNS
 
     async def _fetch_telegram_data(self) -> dict | None:
         timeout = aiohttp.ClientTimeout(total=60)
@@ -130,27 +158,45 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
         # Parse chronologically (old -> new) for correct state accumulation
         return self._parse_messages_to_schedule(reversed(messages))
 
-    def _extract_messages(self, raw_html: str) -> list[str]:
+    def _extract_messages(self, raw_html: str) -> list[tuple[str, str | None]]:
+        """Extract messages with their publication time from HTML."""
         messages = []
-        for match in RE_MESSAGE.finditer(raw_html):
-            text = match.group(1)
+
+        # Split by message blocks to correlate text with time
+        message_blocks = raw_html.split('class="tgme_widget_message_wrap')
+
+        for block in message_blocks[1:]:  # Skip first empty split
+            # Extract text
+            text_match = RE_MESSAGE.search(block)
+            if not text_match:
+                continue
+
+            text = text_match.group(1)
             text = text.replace("<br/>", "\n").replace("<br>", "\n")
             text = re.sub(r"<[^>]+>", "", text)
             text = html.unescape(text)
-            messages.append(text)
+
+            # Extract publication time
+            time_match = RE_TIME.search(block)
+            pub_time = time_match.group(1) if time_match else None
+
+            messages.append((text, pub_time))
+
         return messages
 
-    def _parse_messages_to_schedule(self, messages_iter: Iterable[str]) -> dict:
+    def _parse_messages_to_schedule(
+        self, messages_iter: Iterable[tuple[str, str | None]]
+    ) -> dict:
         schedule = {}  # {group: {day_key: {"date":..., "slots": [...]}}}
         # Use local today, but without tz info as telegram messages don't have year
         today = datetime.datetime.now().date()  # noqa: DTZ005
         tomorrow = today + datetime.timedelta(days=1)
 
-        for msg in messages_iter:
-            if any(city in msg.upper() for city in IGNORED_CITIES):
+        for msg_text, pub_time in messages_iter:
+            if any(city in msg_text.upper() for city in IGNORED_CITIES):
                 continue
 
-            date_match = RE_DATE.search(msg)
+            date_match = RE_DATE.search(msg_text)
             if not date_match:
                 continue
 
@@ -173,10 +219,11 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
             msg_date = datetime.date(year, month_num, day_num)
 
-            # FIX: Convert date to ISO string with timezone
-            # to produce aware datetime objects later
-            dt_naive = datetime.datetime.combine(msg_date, datetime.time.min)
-            dt_aware = dt_naive.astimezone()
+            # FIX: Force Kyiv timezone because Telegram messages use Kyiv time
+            kyiv_tz = ZoneInfo("Europe/Kyiv")
+            dt_aware = datetime.datetime.combine(
+                msg_date, datetime.time.min, tzinfo=kyiv_tz
+            )
             date_str = dt_aware.isoformat()
 
             day_key = None
@@ -187,18 +234,53 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             else:
                 continue
 
-            # Визначаємо тип повідомлення: повне оновлення чи патч?
-            is_full_update = any(m in msg.lower() for m in FULL_SCHEDULE_MARKERS)
+            # Determine message type: full update or patch?
+            is_full_update = any(m in msg_text.lower() for m in FULL_SCHEDULE_MARKERS)
 
             self._parse_message_body(
-                msg,
+                msg_text,
                 date_str,
                 day_key,
                 schedule,
-                is_full_update=is_full_update,
+                metadata={"pub_time": pub_time, "is_full_update": is_full_update},
             )
 
+        # Fill missing today/tomorrow with WaitingForSchedule status
+        self._fill_missing_days(schedule, today, tomorrow)
+
         return schedule
+
+    def _fill_missing_days(
+        self,
+        schedule: dict,
+        today: datetime.date,
+        tomorrow: datetime.date,
+    ) -> None:
+        """Fill missing today/tomorrow with WaitingForSchedule status."""
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+
+        for group_data in schedule.values():
+            # Add today if it doesn't exist
+            if API_KEY_TODAY not in group_data:
+                dt_today = datetime.datetime.combine(
+                    today, datetime.time.min, tzinfo=kyiv_tz
+                )
+                group_data[API_KEY_TODAY] = {
+                    "date": dt_today.isoformat(),
+                    "status": API_STATUS_WAITING_FOR_SCHEDULE,
+                    "slots": [],
+                }
+
+            # Add tomorrow if it doesn't exist
+            if API_KEY_TOMORROW not in group_data:
+                dt_tomorrow = datetime.datetime.combine(
+                    tomorrow, datetime.time.min, tzinfo=kyiv_tz
+                )
+                group_data[API_KEY_TOMORROW] = {
+                    "date": dt_tomorrow.isoformat(),
+                    "status": API_STATUS_WAITING_FOR_SCHEDULE,
+                    "slots": [],
+                }
 
     def _parse_message_body(
         self,
@@ -206,8 +288,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
         date_str: str,
         day_key: str,
         schedule: dict,
-        *,
-        is_full_update: bool,
+        metadata: dict,
     ) -> None:
         parts = re.split(r"(📌\s*\d\.\d)", text)
         current_group = None
@@ -219,7 +300,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 continue
 
             if current_group and part.strip():
-                # Якщо слоти не знайдені (наприклад текст без часу), пропускаємо
+                # If slots are not found (e.g. text without time), skip
                 ranges = self._extract_outage_ranges(part)
                 if not ranges:
                     continue
@@ -227,12 +308,12 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 if current_group not in schedule:
                     schedule[current_group] = {}
 
-                # Ініціалізація структури дня, якщо немає
+                # Initialize day structure if it doesn't exist
                 if day_key not in schedule[current_group]:
                     schedule[current_group][day_key] = {
                         "date": date_str,
                         "status": API_STATUS_SCHEDULE_APPLIES,
-                        "slots": [],  # Починаємо з порожнього
+                        "slots": [],  # Start with empty
                     }
 
                 current_day_data = schedule[current_group][day_key]
@@ -240,14 +321,26 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 if "raw_ranges" not in current_day_data:
                     current_day_data["raw_ranges"] = []
 
+                # Determine update time: either from message or current time
+                pub_time = metadata.get("pub_time")
+                if pub_time:
+                    updated_time = pub_time  # Already in ISO format with timezone
+                else:
+                    kyiv_tz = ZoneInfo("Europe/Kyiv")
+                    updated_time = datetime.datetime.now(tz=kyiv_tz).isoformat()
+
+                is_full_update = metadata.get("is_full_update", False)
                 if is_full_update:
-                    # Якщо це повний апдейт, ми перезаписуємо слоти
+                    # If this is a full update, we overwrite the slots
                     current_day_data["raw_ranges"] = ranges
                 else:
-                    # Patch: додаємо нові діапазони до існуючих
+                    # Patch: add new ranges to existing ones
                     current_day_data["raw_ranges"].extend(ranges)
 
-                # Одразу перераховуємо слоти (для сумісності)
+                # Update updatedOn for the group (for both full update and patch)
+                schedule[current_group]["updatedOn"] = updated_time
+
+                # Immediately recalculate slots (for compatibility)
                 current_day_data["slots"] = self._ranges_to_slots(
                     current_day_data["raw_ranges"]
                 )

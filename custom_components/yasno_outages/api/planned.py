@@ -77,6 +77,10 @@ class PlannedOutagesApi(BaseYasnoApi):
             if API_KEY_DATE not in day_data:
                 continue
 
+            # Only include dates with actual schedule (not WaitingForSchedule)
+            if day_data.get(API_KEY_STATUS) == API_STATUS_WAITING_FOR_SCHEDULE:
+                continue
+
             day_date = datetime.datetime.fromisoformat(day_data[API_KEY_DATE]).date()
             dates.append(day_date)
 
