@@ -19,7 +19,7 @@ PROVIDER_DTEK_FULL: Final = "ДТЕК КИЇВСЬКІ ЕЛЕКТРОМЕРЕЖ�
 PROVIDER_DTEK_SHORT: Final = "ДТЕК"
 
 # Consts
-UPDATE_INTERVAL: Final = 15  # minutes
+UPDATE_INTERVAL: Final = 5  # minutes
 
 # Horizon constants for event lookahead
 PLANNED_OUTAGE_LOOKAHEAD = 1  # day

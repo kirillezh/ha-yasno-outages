@@ -69,7 +69,11 @@ RE_DATE = re.compile(
 )
 
 # Group: 1.1, 2.1
-RE_GROUP_STRICT = re.compile(r"📌\s*(\d\.\d)")
+# Supports: "📌 1.1", "🔹 Черга 1.1", "📌 Черга 1.1", "🔹 1.1"
+# Flexible to handle any emoji before group number
+RE_GROUP_STRICT = re.compile(
+    r"[📌🔹]\s*(?:[Чч]ерга\s*)?(\d\.\d)"  # noqa: RUF001
+)
 
 # Time: 06:00 - 11:00, 06:00 to 11:00
 RE_TIME_RANGE = re.compile(
@@ -123,7 +127,11 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
         elif yasno_data:
             # Fallback to Yasno
             self.planned_outages_data = yasno_data
-            LOGGER.debug("Fallback to Yasno data for group %s", self.group)
+            LOGGER.warning(
+                "Fallback to Yasno data for group %s "
+                "(CEK data not available or group not found)",
+                self.group,
+            )
         else:
             LOGGER.error("Both Yasno and CEK APIs failed to return data")
 
@@ -184,10 +192,12 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
         return messages
 
-    def _parse_messages_to_schedule(
+    def _parse_messages_to_schedule(  # noqa: PLR0912, PLR0915
         self, messages_iter: Iterable[tuple[str, str | None]]
     ) -> dict:
         schedule = {}  # {group: {day_key: {"date":..., "slots": [...]}}}
+        # Track latest update time per group
+        group_update_times: dict[str, str | None] = {}
         # Use local today, but without tz info as telegram messages don't have year
         today = datetime.datetime.now().date()  # noqa: DTZ005
         tomorrow = today + datetime.timedelta(days=1)
@@ -237,16 +247,53 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
             # Determine message type: full update or patch?
             is_full_update = any(m in msg_text.lower() for m in FULL_SCHEDULE_MARKERS)
 
+            # Track which groups are updated in this message
+            groups_in_message: set[str] = set()
+
             self._parse_message_body(
                 msg_text,
                 date_str,
                 day_key,
                 schedule,
                 metadata={"pub_time": pub_time, "is_full_update": is_full_update},
+                groups_updated=groups_in_message,
             )
+
+            # Update latest time for each group found in this message
+            if pub_time:
+                for group in groups_in_message:
+                    # Keep the latest (most recent) publication time
+                    if group not in group_update_times:
+                        group_update_times[group] = pub_time
+                    else:
+                        # Compare timestamps - keep the later one
+                        try:
+                            current_time = datetime.datetime.fromisoformat(
+                                group_update_times[group]
+                            )
+                            new_time = datetime.datetime.fromisoformat(pub_time)
+                            if new_time > current_time:
+                                group_update_times[group] = pub_time
+                        except (ValueError, TypeError):
+                            # If parsing fails, use the new one
+                            group_update_times[group] = pub_time
 
         # Fill missing today/tomorrow with WaitingForSchedule status
         self._fill_missing_days(schedule, today, tomorrow)
+
+        # Set updatedOn for each group using the latest time
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        for group, latest_time in group_update_times.items():
+            if group in schedule:
+                schedule[group]["updatedOn"] = latest_time
+
+        # For groups found in messages but without pub_time,
+        # use current time as fallback
+        # This ensures updatedOn is always set if group has data
+        current_time = datetime.datetime.now(tz=kyiv_tz).isoformat()
+        for group_data in schedule.values():
+            if "updatedOn" not in group_data:
+                group_data["updatedOn"] = current_time
 
         return schedule
 
@@ -282,15 +329,21 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                     "slots": [],
                 }
 
-    def _parse_message_body(
+    def _parse_message_body(  # noqa: PLR0913
         self,
         text: str,
         date_str: str,
         day_key: str,
         schedule: dict,
         metadata: dict,
+        groups_updated: set[str],
     ) -> None:
-        parts = re.split(r"(📌\s*\d\.\d)", text)
+        # Split by group markers - supports both 📌 and 🔹 formats
+        # Flexible pattern to handle any emoji variations
+        parts = re.split(
+            r"([📌🔹]\s*(?:[Чч]ерга\s*)?\d\.\d)",  # noqa: RUF001
+            text,
+        )
         current_group = None
 
         for part in parts:
@@ -321,13 +374,8 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 if "raw_ranges" not in current_day_data:
                     current_day_data["raw_ranges"] = []
 
-                # Determine update time: either from message or current time
-                pub_time = metadata.get("pub_time")
-                if pub_time:
-                    updated_time = pub_time  # Already in ISO format with timezone
-                else:
-                    kyiv_tz = ZoneInfo("Europe/Kyiv")
-                    updated_time = datetime.datetime.now(tz=kyiv_tz).isoformat()
+                # Track that this group was updated in this message
+                groups_updated.add(current_group)
 
                 is_full_update = metadata.get("is_full_update", False)
                 if is_full_update:
@@ -336,9 +384,6 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 else:
                     # Patch: add new ranges to existing ones
                     current_day_data["raw_ranges"].extend(ranges)
-
-                # Update updatedOn for the group (for both full update and patch)
-                schedule[current_group]["updatedOn"] = updated_time
 
                 # Immediately recalculate slots (for compatibility)
                 current_day_data["slots"] = self._ranges_to_slots(
