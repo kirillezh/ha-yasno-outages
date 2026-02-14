@@ -93,6 +93,19 @@ class PlannedOutagesApi(BaseYasnoApi):
     ) -> list[OutageEvent]:
         """Parse schedule for a single day."""
         slots = self._parse_raw_slots(day_data.get("slots", []))
+        # Debug: log slots that span midnight
+        minutes_in_day = 1440
+        for slot in slots:
+            if slot.end == minutes_in_day:  # 24:00
+                start_hour = slot.start // 60
+                start_min = slot.start % 60
+                LOGGER.debug(
+                    "Slot spans midnight: %02d:%02d-24:00 (date: %s, type: %s)",
+                    start_hour,
+                    start_min,
+                    date.date(),
+                    slot.event_type.value,
+                )
         return self._parse_slots_to_events(slots, date, OutageSource.PLANNED)
 
     def _parse_day_events(
@@ -116,7 +129,19 @@ class PlannedOutagesApi(BaseYasnoApi):
             return []
 
         day_date = datetime.datetime.fromisoformat(day_data[API_KEY_DATE])
-        return self._parse_day_schedule(day_data, day_date)
+        events = self._parse_day_schedule(day_data, day_date)
+
+        # Debug: log events that span midnight
+        for event in events:
+            if event.end.date() != event.start.date():
+                LOGGER.debug(
+                    "Event spans midnight: %s -> %s (day_key: %s)",
+                    event.start,
+                    event.end,
+                    day_key,
+                )
+
+        return events
 
     def get_updated_on(self) -> datetime.datetime | None:
         """Get the updated on timestamp for the configured group."""

@@ -164,7 +164,8 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
 
         messages = self._extract_messages(html_content)
         # Parse chronologically (old -> new) for correct state accumulation
-        return self._parse_messages_to_schedule(reversed(messages))
+        # Messages are already in chronological order (oldest first)
+        return self._parse_messages_to_schedule(messages)
 
     def _extract_messages(self, raw_html: str) -> list[tuple[str, str | None]]:
         """Extract messages with their publication time from HTML."""
@@ -329,7 +330,7 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                     "slots": [],
                 }
 
-    def _parse_message_body(  # noqa: PLR0913
+    def _parse_message_body(  # noqa: PLR0912, PLR0913
         self,
         text: str,
         date_str: str,
@@ -380,15 +381,54 @@ class CekPlannedOutagesApi(PlannedOutagesApi):
                 is_full_update = metadata.get("is_full_update", False)
                 if is_full_update:
                     # If this is a full update, we overwrite the slots
+                    if current_group == "4.2":  # Debug for target group
+                        LOGGER.debug(
+                            "CEK full update for group %s, day_key %s: "
+                            "overwriting ranges %s with %s",
+                            current_group,
+                            day_key,
+                            current_day_data.get("raw_ranges", []),
+                            ranges,
+                        )
                     current_day_data["raw_ranges"] = ranges
                 else:
                     # Patch: add new ranges to existing ones
+                    if current_group == "4.2":  # Debug for target group
+                        LOGGER.debug(
+                            "CEK patch for group %s, day_key %s: "
+                            "adding ranges %s to existing %s",
+                            current_group,
+                            day_key,
+                            ranges,
+                            current_day_data.get("raw_ranges", []),
+                        )
                     current_day_data["raw_ranges"].extend(ranges)
 
                 # Immediately recalculate slots (for compatibility)
                 current_day_data["slots"] = self._ranges_to_slots(
                     current_day_data["raw_ranges"]
                 )
+                if current_group == "4.2":  # Debug for target group
+                    LOGGER.debug(
+                        "CEK final ranges for group %s, day_key %s: %s",
+                        current_group,
+                        day_key,
+                        current_day_data["raw_ranges"],
+                    )
+                # Debug: log slots that span midnight
+                for slot in current_day_data["slots"]:
+                    if slot.get("end") == MINUTES_IN_DAY:
+                        start_hour = slot.get("start", 0) // 60
+                        start_min = slot.get("start", 0) % 60
+                        LOGGER.debug(
+                            "CEK slot spans midnight: %02d:%02d-24:00 "
+                            "(group: %s, day_key: %s, type: %s)",
+                            start_hour,
+                            start_min,
+                            current_group,
+                            day_key,
+                            slot.get("type"),
+                        )
 
     def _extract_outage_ranges(self, text: str) -> list[tuple[int, int]]:
         ranges = []
